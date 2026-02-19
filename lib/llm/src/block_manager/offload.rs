@@ -69,7 +69,7 @@ use derive_builder::Builder;
 use derive_getters::Getters;
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 
-pub const MAX_CONCURRENT_TRANSFERS: usize = 4;
+pub const MAX_CONCURRENT_TRANSFERS: usize = 64;
 pub const MAX_TRANSFER_BATCH_SIZE: usize = 16;
 
 /// Configuration for creating an OffloadManager
@@ -147,10 +147,14 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
 
         let pool_config = PoolConfig {
             enable_pool: true,
+            enable_temp_device_buffer_pool: false,
             max_concurrent_transfers: MAX_CONCURRENT_TRANSFERS,
             max_transfer_batch_size: MAX_TRANSFER_BATCH_SIZE,
             num_outer_components: config.model_config.outer_dim,
             num_layers: config.model_config.num_layers,
+            page_size: config.model_config.page_size,
+            inner_dim: config.model_config.inner_dim,
+            dtype_width_bytes: config.model_config.dtype_width_bytes,
         };
 
         // We want cuda offloads to happen in parallel with host onboards, so we need to use a different stream.
@@ -437,6 +441,34 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                                 target_pool.clone(),
                             ))
                             .await?;
+
+                        // Await the next request, batching if possible
+                        tokio::select! {
+                            _ = cancellation_token.cancelled() => return Ok(()),
+                            Some(request) = offload_rx.recv() => {
+                                queue.insert(request);
+
+                                // Batch up to MAX_TRANSFER_BATCH_SIZE requests
+                                while queue.len() < MAX_CONCURRENT_TRANSFERS {
+                                    match offload_rx.try_recv() {
+                                        Ok(req) => {
+                                            queue.insert(req);
+                                        }
+                                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                                    }
+                                    if queue.len() >= MAX_TRANSFER_BATCH_SIZE {
+                                        break;
+                                    }
+                                }
+
+                                // If we exceed concurrency, drain oldest completions first
+                                while queue.len() > MAX_CONCURRENT_TRANSFERS {
+                                    // For now, drop oldest requests to maintain concurrency bound
+                                    let _ = queue.pop_first();
+                                }
+                            }
+                        }
                     }
                 }
             } else {

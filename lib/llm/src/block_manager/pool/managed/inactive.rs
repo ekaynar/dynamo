@@ -467,6 +467,9 @@ impl<S: Storage, L: LocalityProvider, M: BlockMetadata> InactiveBlockPool<S, L, 
             }
         }
 
+        // Adjacent blocks can be written/read together, sort by block_id to improve IO locality
+        blocks.sort_by_key(|block| block.block_id());
+
         let acquired_count = blocks.len();
         tracing::debug!(
             acquired_count,

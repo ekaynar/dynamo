@@ -7,11 +7,123 @@ use anyhow::Result;
 use nixl_sys::{MemoryRegion, NixlDescriptor, XferDescList, XferStatus};
 use std::future::Future;
 
+type Addr = usize;
+type DeviceId = u64;
+type Size = usize;
+
+/// Maximum size for a single transfer entry in bytes (vast_dynamo aggregation)
+const MAX_TRANSFER_SIZE: usize = 4 * 1024 * 1024; // 4MB
+
+#[derive(Debug)]
+struct XferAggr {
+    descriptors: Vec<(Addr, Addr, Size, DeviceId, DeviceId)>, // (src_addr, dst_addr, size, src_device_id, dst_device_id)
+}
+
+impl XferAggr {
+    fn new() -> Self {
+        Self { descriptors: Vec::new() }
+    }
+
+    fn add_desc(
+        &mut self,
+        src: Addr,
+        dst: Addr,
+        size: Size,
+        src_device_id: DeviceId,
+        dst_device_id: DeviceId,
+    ) {
+        self.descriptors
+            .push((src, dst, size, src_device_id, dst_device_id));
+    }
+
+    fn populate_xfer_desc_list(
+        &mut self,
+        src_dl: &mut XferDescList,
+        dst_dl: &mut XferDescList,
+    ) -> Result<()> {
+        // Sort by (src_device_id, dst_device_id, src_addr) for better grouping
+        self.descriptors.sort_by_key(
+            |&(src_addr, _dst_addr, _size, src_device_id, dst_device_id)| {
+                (src_device_id, dst_device_id, src_addr)
+            },
+        );
+
+        let mut pending: Option<(Addr, Addr, Size, DeviceId, DeviceId)> = None;
+
+        for (src, dst, size, src_device_id, dst_device_id) in self.descriptors.drain(..) {
+            if let Some((last_src, last_dst, last_size, last_src_device_id, last_dst_device_id)) =
+                &mut pending
+            {
+                // Merge contiguous descriptors when possible
+                if *last_src_device_id == src_device_id
+                    && *last_dst_device_id == dst_device_id
+                    && *last_src + *last_size == src
+                    && *last_dst + *last_size == dst
+                    && *last_size + size <= MAX_TRANSFER_SIZE
+                {
+                    *last_size += size;
+                    continue;
+                } else {
+                    // Flush pending
+                    Self::add_chunked_descriptors(
+                        src_dl,
+                        dst_dl,
+                        *last_src,
+                        *last_dst,
+                        *last_size,
+                        *last_src_device_id,
+                        *last_dst_device_id,
+                    )?;
+                }
+            }
+
+            pending = Some((src, dst, size, src_device_id, dst_device_id));
+        }
+
+        if let Some((last_src, last_dst, last_size, last_src_device_id, last_dst_device_id)) =
+            pending
+        {
+            Self::add_chunked_descriptors(
+                src_dl,
+                dst_dl,
+                last_src,
+                last_dst,
+                last_size,
+                last_src_device_id,
+                last_dst_device_id,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Add descriptors to the transfer lists, chunking large transfers if they exceed MAX_TRANSFER_SIZE
+    fn add_chunked_descriptors(
+        src_dl: &mut XferDescList,
+        dst_dl: &mut XferDescList,
+        mut src_addr: Addr,
+        mut dst_addr: Addr,
+        mut size: Size,
+        src_device_id: DeviceId,
+        dst_device_id: DeviceId,
+    ) -> Result<()> {
+        while size > 0 {
+            let chunk_size = size.min(MAX_TRANSFER_SIZE);
+            src_dl.add_desc(src_addr, chunk_size, src_device_id);
+            dst_dl.add_desc(dst_addr, chunk_size, dst_device_id);
+
+            src_addr += chunk_size;
+            dst_addr += chunk_size;
+            size -= chunk_size;
+        }
+        Ok(())
+    }
+}
+
 fn append_xfer_request<Source, Destination>(
     src: &Source,
     dst: &mut Destination,
-    src_dl: &mut XferDescList,
-    dst_dl: &mut XferDescList,
+    xfer_aggr: &mut XferAggr,
 ) -> Result<()>
 where
     Source: BlockDataProvider,
@@ -26,17 +138,17 @@ where
         let src_desc = src_data.block_view()?.as_nixl_descriptor();
         let dst_desc = dst_data.block_view_mut()?.as_nixl_descriptor_mut();
 
-        unsafe {
-            src_dl.add_desc(
-                src_desc.as_ptr() as usize,
-                src_desc.size(),
-                src_desc.device_id(),
-            );
+        // Extract device IDs from both descriptors
+        let src_device_id = src_desc.device_id();
+        let dst_device_id = dst_desc.device_id();
 
-            dst_dl.add_desc(
+        unsafe {
+            xfer_aggr.add_desc(
+                src_desc.as_ptr() as usize,
                 dst_desc.as_ptr() as usize,
-                dst_desc.size(),
-                dst_desc.device_id(),
+                src_desc.size(),
+                src_device_id,
+                dst_device_id,
             );
         }
 
@@ -53,17 +165,16 @@ where
                 let src_desc = src_view.as_nixl_descriptor();
                 let dst_desc = dst_view.as_nixl_descriptor_mut();
 
-                unsafe {
-                    src_dl.add_desc(
-                        src_desc.as_ptr() as usize,
-                        src_desc.size(),
-                        src_desc.device_id(),
-                    );
+                let src_device_id = src_desc.device_id();
+                let dst_device_id = dst_desc.device_id();
 
-                    dst_dl.add_desc(
+                unsafe {
+                    xfer_aggr.add_desc(
+                        src_desc.as_ptr() as usize,
                         dst_desc.as_ptr() as usize,
-                        dst_desc.size(),
-                        dst_desc.device_id(),
+                        src_desc.size(),
+                        src_device_id,
+                        dst_device_id,
                     );
                 }
             }
@@ -112,9 +223,14 @@ where
     let mut src_dl = XferDescList::new(src_mem_type)?;
     let mut dst_dl = XferDescList::new(dst_mem_type)?;
 
+    // Aggregate contiguous descriptors before adding to XferDescList
+    let mut xfer_aggr = XferAggr::new();
+
     for (src, dst) in src.iter().zip(dst.iter_mut()) {
-        append_xfer_request(src, dst, &mut src_dl, &mut dst_dl)?;
+        append_xfer_request(src, dst, &mut xfer_aggr)?;
     }
+
+    xfer_aggr.populate_xfer_desc_list(&mut src_dl, &mut dst_dl)?;
 
     let xfer_req = nixl_agent.create_xfer_req(
         transfer_type.as_xfer_op(),

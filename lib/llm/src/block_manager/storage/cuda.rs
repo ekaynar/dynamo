@@ -94,7 +94,7 @@ unsafe fn malloc_host_prefer_writecombined(size: usize) -> Result<*mut u8, Stora
     match unsafe {
         cudarc::driver::result::malloc_host(
             size,
-            cudarc::driver::sys::CU_MEMHOSTALLOC_WRITECOMBINED,
+            cudarc::driver::sys::CU_MEMHOSTALLOC_DEVICEMAP,
         )
     } {
         Ok(ptr) => Ok(ptr as *mut u8),

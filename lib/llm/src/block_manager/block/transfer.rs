@@ -12,6 +12,7 @@ use super::*;
 use crate::block_manager::storage::{
     DeviceStorage, DiskStorage, PinnedStorage, SystemStorage,
     nixl::{NixlRegisterableStorage, NixlStorage},
+    StorageType,
 };
 
 use nixl_sys::NixlDescriptor;
@@ -256,8 +257,96 @@ where
             }
         }
         TransferStrategy::Nixl(transfer_type) => {
-            let transfer_fut = nixl::write_blocks_to(sources, targets, &ctx, transfer_type)?;
+            let src_block_type = sources[0].block_data();
+            let src_contig = src_block_type.is_fully_contiguous();
+            let src_disk = matches!(src_block_type.storage_type(), StorageType::Disk(_));
+            let target_block_type = targets[0].block_data();
+            let target_contig = target_block_type.is_fully_contiguous();
+            let target_disk = matches!(target_block_type.storage_type(), StorageType::Disk(_));
 
+            // Layout mismatch: use temp device buffers for conversion
+            if (!src_contig && !src_disk && target_contig && target_disk)
+                || (src_contig && src_disk && !target_contig && !target_disk)
+            {
+                tracing::debug!(
+                    "Using temporary GPU buffer for layout conversion: {} to {}",
+                    if src_contig { "contig source" } else { "non-contig source" },
+                    if target_contig { "contig target" } else { "non-contig target" },
+                );
+
+                // Acquire one temp buffer per block
+                let mut temp_bufs = Vec::with_capacity(targets.len());
+                for _ in 0..targets.len() {
+                    match ctx.acquire_temp_device_buffer() {
+                        Ok(buf) => temp_bufs.push(buf),
+                        Err(e) => {
+                            tracing::warn!("Failed to acquire temporary GPU buffer: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                if temp_bufs.len() == targets.len() {
+                    let mut dest_slice: Vec<_> = temp_bufs.iter().map(|x| x.data.to_owned()).collect();
+
+                    if target_disk {
+                        // Non-contig GPU -> contig disk: consolidate to temp, then write
+                        match cuda::copy_blocks_with_customized_kernel(
+                            sources,
+                            &mut dest_slice,
+                            ctx.stream().as_ref(),
+                            &ctx,
+                        ) {
+                            Ok(_) => {
+                                let transfer_fut = nixl::write_blocks_to(&dest_slice, targets, &ctx, transfer_type)?;
+                                ctx.async_rt_handle().spawn(async move {
+                                    let temp_bufs = temp_bufs;
+                                    transfer_fut.await;
+                                    tx.send(()).unwrap();
+                                    drop(temp_bufs);
+                                });
+                                return Ok(rx);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Temp-buffer consolidation failed: {}, falling back", e);
+                            }
+                        }
+                    } else {
+                        // Contig disk -> non-contig GPU: write to temp, then scatter
+                        let transfer_fut = nixl::write_blocks_to(sources, &mut dest_slice, &ctx, transfer_type)?;
+                        let (src_addresses, dst_addresses, dims) =
+                            cuda::get_address_pairs(&dest_slice, targets)?;
+
+                        let ctx2 = ctx.clone();
+                        ctx.async_rt_handle().spawn(async move {
+                            let temp_bufs = temp_bufs;
+                            transfer_fut.await;
+
+                            let _context_guard = ctx2.stream().context().bind_to_thread();
+                            match cuda::copy_pairs_with_customized_kernel(
+                                src_addresses,
+                                dst_addresses,
+                                dims,
+                                ctx2.stream().as_ref(),
+                                &ctx2,
+                            ) {
+                                Ok(_) => tx.send(()).unwrap(),
+                                Err(e) => {
+                                    tracing::warn!("Temp-buffer scatter failed: {}, but transfer completed", e);
+                                    tx.send(()).unwrap();
+                                }
+                            }
+                            drop(temp_bufs);
+                        });
+                        return Ok(rx);
+                    }
+                }
+
+                tracing::debug!("Temp buffer pool unavailable or failed; using direct NIXL transfer");
+            }
+
+            // Fallback direct NIXL transfer
+            let transfer_fut = nixl::write_blocks_to(sources, targets, &ctx, transfer_type)?;
             ctx.async_rt_handle().spawn(async move {
                 transfer_fut.await;
                 tx.send(()).unwrap();

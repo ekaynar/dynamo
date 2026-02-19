@@ -154,7 +154,7 @@ unsafe fn launch_copy_kernel_direct(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct CachedBlockDimensions {
+pub(super) struct CachedBlockDimensions {
     num_layers: usize,
     num_outer_dims: usize,
     layer_size: usize,
@@ -292,6 +292,67 @@ where
         .synchronize()
         .map_err(|e| TransferError::ExecutionError(format!("Failed to sync H2D event: {}", e)))?;
 
+    Ok(())
+}
+
+/// Collect address pairs for KV blocks (source & destination) using cached dimensions
+pub fn get_address_pairs<'a, Source, Destination>(
+    sources: &'a [Source],
+    destinations: &'a mut [Destination],
+) -> Result<(Vec<u64>, Vec<u64>, CachedBlockDimensions), TransferError>
+where
+    Source: BlockDataProvider,
+    Destination: BlockDataProviderMut,
+{
+    // Get cached dimensions (calculated once per program lifetime!)
+    let dims = get_cached_block_dimensions(&sources[0])?;
+
+    // Use cached dimensions
+    let (src_addresses, dst_addresses) =
+        collect_kv_addresses(sources, destinations, dims.num_layers, dims.num_outer_dims)?;
+
+    Ok((src_addresses, dst_addresses, dims))
+}
+
+/// Copy address pairs using customized kernel (address arrays already provided)
+pub fn copy_pairs_with_customized_kernel(
+    src_addresses: Vec<u64>,
+    dst_addresses: Vec<u64>,
+    dims: CachedBlockDimensions,
+    stream: &CudaStream,
+    ctx: &crate::block_manager::block::transfer::TransferContext,
+) -> Result<(), TransferError> {
+    let _context_guard = stream.context().bind_to_thread();
+
+    // Use pooled pinned buffers for addresses
+    let resources =
+        crate::block_manager::block::transfer::context::TransferResources::acquire_for_kernel_launch(
+            ctx,
+            src_addresses.len(),
+        )?;
+
+    // Copy addresses to pinned buffers
+    resources.copy_addresses_to_buffers(&src_addresses, &dst_addresses)?;
+
+    tracing::debug!(
+        " Using pooled pinned buffers: src=0x{:x}, dst=0x{:x} ({} address pairs)",
+        resources.src_ptr(),
+        resources.dst_ptr(),
+        src_addresses.len()
+    );
+
+    // Launch kernel with pooled resources (addresses already copied)
+    unsafe {
+        launch_copy_kernel_direct(
+            resources.src_ptr(),
+            resources.dst_ptr(),
+            src_addresses.len(),
+            dims.layer_size,
+            stream,
+        )?;
+    }
+
+    tracing::debug!("vectorized_copy completed - resources will be returned to pool automatically");
     Ok(())
 }
 
